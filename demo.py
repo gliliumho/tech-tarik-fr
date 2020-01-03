@@ -1,31 +1,30 @@
 #! python3
-
+import argparse
 import os
+import sys
 from typing import List
+
 import cv2
+import joblib
 import numpy as np
 import tensorflow as tf
-
 from sklearn.neighbors import BallTree
-from sklearn import linear_model
-import joblib
 
 import align.detect_face
 from facenet import facenet
 
-
 VIDEO_INPUT = 0
 FACE_MODEL = 'models/20180402-114759.pb'
-FACE_DETECT_MINSIZE = 10
+FACE_DETECT_MINSIZE = 20
 MTCNN_THRESHOLD = [0.7, 0.7, 0.7]
 MTCNN_FACTOR = 0.3
 
 FACE_PREDICT_IMGSIZE = 160
-FACE_PREDICT_THRESHOLD = 0.5
+FACE_PREDICT_THRESHOLD = 0.95
 
 FACE_PREDICT_MODEL_PATH = 'models/prediction_model.pkl'
 
-SHOW_FACE_IMAGE_FLAG = True
+SHOW_FACE_IMAGE_FLAG = False
 
 
 class Face:
@@ -74,12 +73,14 @@ class FR:
     onet = None
     fnet = None
 
-    predict_model = None
+    balltree = None  # Has type 'BallTree'
     registered_name_list = []
+    registered_face_features = []
 
     def __init__(self):
-        self.load_networks()
-        self.load_prediction_model()
+        pass
+        # self.load_networks()
+        # self.load_balltree()
 
     def load_networks(self):
         with tf.Graph().as_default():
@@ -99,23 +100,22 @@ class FR:
                 embeddings = tf.get_default_graph().get_tensor_by_name("embeddings:0")
                 phase_train_placeholder = tf.get_default_graph().get_tensor_by_name("phase_train:0")
                 self.fnet = lambda images: sess.run(embeddings, feed_dict={
-                                                    images_placeholder: images, phase_train_placeholder: False})
+                    images_placeholder: images, phase_train_placeholder: False})
 
-    def load_prediction_model(self):
+    def load_balltree(self):
         if os.path.exists(FACE_PREDICT_MODEL_PATH):
-            self.predict_model, self.registered_name_list = joblib.load(
+            self.balltree, self.registered_name_list = joblib.load(
                 FACE_PREDICT_MODEL_PATH)
         else:
             print("Prediction model does not exist, no registered faces.")
-            # self.predict_model = BallTree(np.empty([0, 64], dtype=np.float))
-            # joblib.dump((self.predict_model, []), FACE_PREDICT_MODEL_PATH)
+
 
     def detect_faces(self, full_frame: np.array):
         face_locations = align.detect_face.detect_face(
             full_frame, FACE_DETECT_MINSIZE, self.pnet, self.rnet, self.onet, MTCNN_THRESHOLD, MTCNN_FACTOR)
 
         face_detections = []
-        img_size = np.asarray_chkfinite(full_frame.shape)
+        # img_size = np.asarray_chkfinite(full_frame.shape)
         for faceloc in face_locations[0]:
             face_det = FaceDetection(faceloc[0:4], full_frame)
             face_detections.append(face_det)
@@ -138,7 +138,7 @@ class FR:
 
         face_features = self.fnet(prewhitened_face_images)
         face_features = np.array(
-            [f[12::14]/np.linalg.norm(f[12::14]) for f in face_features])
+            [f[12::14] / np.linalg.norm(f[12::14]) for f in face_features])
 
         print("Face detections: %d" % len(face_detections))
         print("Face features: %d" % len(face_features))
@@ -148,13 +148,59 @@ class FR:
 
         return face_features
 
+    def predict_face(self, face_detection: FaceDetection):
+        if not self.balltree:
+            return "unknown, balltree not loaded"
+        distance, name_index = self.balltree.query(face_detection.get_face_feature().reshape(1, -1))
+        print(distance)
+        if distance[0] > FACE_PREDICT_THRESHOLD:
+            face_detection.name = "unknown"
+        else:
+            face_detection.name = self.registered_name_list[int(name_index[0])]
+
+        return face_detection.name
+
+    def save_face(self, rgb_image, name):
+        face_detections = self.detect_faces(rgb_image)
+        face_features = self.get_face_features(face_detections)
+        # print(type(face_features))
+        self.registered_face_features.append(face_features[0])
+        self.registered_name_list.append(name)
+
+        print(self.registered_face_features)
+        print(np.asarray(self.registered_face_features))
+        print(name)
+        self.balltree = BallTree(np.asarray(self.registered_face_features))
+        joblib.dump((self.balltree, self.registered_name_list), FACE_PREDICT_MODEL_PATH)
+
+
+def parse_args(args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--saveImage', metavar='PATH_TO_IMAGE', type=str, help='register image to balltree')
+    return parser.parse_args(args)
+
+
+def label_image(image, face_detections):
+    return image
+    pass
 
 def main():
-    vid_capture = cv2.VideoCapture(VIDEO_INPUT)
-    if vid_capture.isOpened() == False:
-        print("Error opening %s" % (VIDEO_INPUT))
     fr = FR()
     fr.load_networks()
+
+    args = parse_args(sys.argv[1:])
+    if args.saveImage:
+        print(args.saveImage)
+        img = cv2.imread(args.saveImage)
+        img_name = os.path.split(args.saveImage)[-1]
+        img_name_without_ext = img_name.split('.')[0]
+        fr.save_face(img[:, :, ::-1], img_name_without_ext)
+
+    fr.load_balltree()
+
+    vid_capture = cv2.VideoCapture(VIDEO_INPUT)
+    if not vid_capture.isOpened():
+        print("Error opening %s" % VIDEO_INPUT)
 
     while True:
         ret, bgr_frame = vid_capture.read()
@@ -163,7 +209,11 @@ def main():
             rgb_frame = bgr_frame[:, :, ::-1]
             face_detections = fr.detect_faces(rgb_frame)
             if face_detections:
-                face_features = fr.get_face_features(face_detections)
+                fr.get_face_features(face_detections)
+                for face_det in face_detections:
+                    name = fr.predict_face(face_det)
+                    print(name)
+                bgr_frame = label_image(bgr_frame, face_detections)
 
             print(len(face_detections))
 
