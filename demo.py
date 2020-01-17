@@ -1,5 +1,6 @@
 #! python3
 import argparse
+import glob
 import os
 import sys
 from typing import List
@@ -20,7 +21,7 @@ MTCNN_THRESHOLD = [0.7, 0.7, 0.7]
 MTCNN_FACTOR = 0.3
 
 FACE_PREDICT_IMGSIZE = 160
-FACE_PREDICT_THRESHOLD = 0.95
+FACE_PREDICT_THRESHOLD = 0.85
 
 FACE_PREDICT_MODEL_PATH = 'models/prediction_model.pkl'
 
@@ -43,6 +44,7 @@ class FaceDetection:
     face_image = None
     face_feature = []
     name = ""
+    distance = 999
 
     def __init__(self, cord: np.array, rgb_frame):
         self.x1 = int(cord[0])
@@ -50,6 +52,9 @@ class FaceDetection:
         self.x2 = int(cord[2])
         self.y2 = int(cord[3])
         self.face_image = rgb_frame[self.y1:self.y2, self.x1:self.x2]
+
+    def get_cord(self):
+        return (self.x1, self.y1), (self.x2, self.y2)
 
     def get_face_image(self):
         return self.face_image
@@ -109,7 +114,6 @@ class FR:
         else:
             print("Prediction model does not exist, no registered faces.")
 
-
     def detect_faces(self, full_frame: np.array):
         face_locations = align.detect_face.detect_face(
             full_frame, FACE_DETECT_MINSIZE, self.pnet, self.rnet, self.onet, MTCNN_THRESHOLD, MTCNN_FACTOR)
@@ -129,19 +133,21 @@ class FR:
     def get_face_features(self, face_detections: List[FaceDetection]):
         prewhitened_face_images = []
         for face_det in face_detections:
-            face_img = cv2.resize(
-                face_det.get_face_image(), (FACE_PREDICT_IMGSIZE, FACE_PREDICT_IMGSIZE))
-            prewhitened = facenet.prewhiten(face_img)
-            prewhitened_face_images.append(prewhitened)
+            try:
+                face_img = cv2.resize(
+                    face_det.get_face_image(), (FACE_PREDICT_IMGSIZE, FACE_PREDICT_IMGSIZE))
+                prewhitened = facenet.prewhiten(face_img)
+                prewhitened_face_images.append(prewhitened)
+            except:
+                print("error image")
 
+        if not prewhitened_face_images:
+            return None
         prewhitened_face_images = np.stack(prewhitened_face_images)
 
         face_features = self.fnet(prewhitened_face_images)
         face_features = np.array(
             [f[12::14] / np.linalg.norm(f[12::14]) for f in face_features])
-
-        print("Face detections: %d" % len(face_detections))
-        print("Face features: %d" % len(face_features))
 
         for i, face_det in enumerate(face_detections):
             face_det.set_face_feature(face_features[i])
@@ -152,24 +158,22 @@ class FR:
         if not self.balltree:
             return "unknown, balltree not loaded"
         distance, name_index = self.balltree.query(face_detection.get_face_feature().reshape(1, -1))
-        print(distance)
         if distance[0] > FACE_PREDICT_THRESHOLD:
             face_detection.name = "unknown"
+            face_detection.distance = 9.9
         else:
             face_detection.name = self.registered_name_list[int(name_index[0])]
+            face_detection.distance = distance
 
         return face_detection.name
 
     def save_face(self, rgb_image, name):
         face_detections = self.detect_faces(rgb_image)
         face_features = self.get_face_features(face_detections)
-        # print(type(face_features))
+        if face_features is None:
+            return
         self.registered_face_features.append(face_features[0])
         self.registered_name_list.append(name)
-
-        print(self.registered_face_features)
-        print(np.asarray(self.registered_face_features))
-        print(name)
         self.balltree = BallTree(np.asarray(self.registered_face_features))
         joblib.dump((self.balltree, self.registered_name_list), FACE_PREDICT_MODEL_PATH)
 
@@ -177,19 +181,31 @@ class FR:
 def parse_args(args):
     parser = argparse.ArgumentParser()
     parser.add_argument('--saveImage', metavar='PATH_TO_IMAGE', type=str, help='register image to balltree')
+    parser.add_argument('--saveImages', metavar='PATH_TO_FOLDER', type=str, help='register images to balltree')
     return parser.parse_args(args)
 
 
 def label_image(image, face_detections):
-    return image
-    pass
+    for face_det in face_detections:
+        topleft, bottomright = face_det.get_cord()
+        cv2.rectangle(image, topleft, bottomright, (255, 0, 0), 2)
+        cv2.putText(image, "%s %.2f" % (face_det.name, face_det.distance), topleft, cv2.FONT_HERSHEY_PLAIN, 2,
+                    (200, 200, 100), 2)
+
 
 def main():
     fr = FR()
     fr.load_networks()
 
     args = parse_args(sys.argv[1:])
-    if args.saveImage:
+    if args.saveImages:
+        for imgpath in glob.glob(os.path.join(args.saveImages, "*.jpg")):
+            print(imgpath)
+            img = cv2.imread(imgpath)
+            img_name = os.path.split(imgpath)[-1]
+            img_name_without_ext = img_name.split('.')[0]
+            fr.save_face(img[:, :, ::-1], img_name_without_ext)
+    elif args.saveImage:
         print(args.saveImage)
         img = cv2.imread(args.saveImage)
         img_name = os.path.split(args.saveImage)[-1]
@@ -211,11 +227,10 @@ def main():
             if face_detections:
                 fr.get_face_features(face_detections)
                 for face_det in face_detections:
-                    name = fr.predict_face(face_det)
-                    print(name)
-                bgr_frame = label_image(bgr_frame, face_detections)
-
-            print(len(face_detections))
+                    if face_det.get_face_feature() is None:
+                        continue
+                    fr.predict_face(face_det)
+                label_image(bgr_frame, face_detections)
 
             cv2.imshow('FR demo', bgr_frame)
             cv2.waitKey(100)
